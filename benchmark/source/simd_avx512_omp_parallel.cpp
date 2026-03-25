@@ -4,6 +4,7 @@
 #include <stack>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <immintrin.h>
 #include <omp.h>
 

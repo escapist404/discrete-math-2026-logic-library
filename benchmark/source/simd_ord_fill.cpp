@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <iostream>
 #include <numeric>
 #include <stack>
