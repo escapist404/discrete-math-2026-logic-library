@@ -1,0 +1,6 @@
+Scenario,legacy,simd_avx2_precalc,simd_avx2_omp_parallel
+"var_count = 21, wff_len = 5000",TIMEOUT,0.181943s,0.095156s
+"var_count = 22, wff_len = 2000",TIMEOUT,0.196913s,0.150627s
+"var_count = 22, wff_len = 120000",TIMEOUT,16.380365s,1.046279s
+"var_count = 22, wff_len = 500000",TIMEOUT,TIMEOUT,3.804785s
+"var_count = 22, wff_len = 1000000",TIMEOUT,TIMEOUT,7.436118s

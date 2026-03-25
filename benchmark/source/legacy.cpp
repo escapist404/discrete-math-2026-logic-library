@@ -3,6 +3,7 @@
 #include <numeric>
 #include <stack>
 #include <vector>
+#include <cstdint>
 
 const size_t SIGMA = 26;
 

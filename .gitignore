@@ -1,1 +1,5 @@
 benchmark/test_results/**/*.txt
+__pycache__
+*.o
+*.d
+*.bin

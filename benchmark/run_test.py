@@ -2,6 +2,8 @@
 
 # self custom test runner for benchmarking the various implementations
 # implemented by Gemini
+# modified by Richard Qin
+# do not trust ai, they may cheat you, always verify the results
 
 import argparse
 import csv
@@ -9,6 +11,7 @@ import subprocess
 import time
 import os
 import sys
+import re
 
 SOURCE_DIR = "source"
 UTILITY_DIR = "utility"
@@ -22,7 +25,8 @@ CPP_FILES = {
     "simd_avx2_fill": os.path.join(SOURCE_DIR, "simd_avx2_fill.cpp"),
     "simd_avx2_precalc": os.path.join(SOURCE_DIR, "simd_avx2_precalc.cpp"),
     "simd_avx512_precalc": os.path.join(SOURCE_DIR, "simd_avx512_precalc.cpp"),
-    "simd_avx512_omp_parallel": os.path.join(SOURCE_DIR, "simd_avx512_omp_parallel.cpp")
+    "simd_avx512_omp_parallel": os.path.join(SOURCE_DIR, "simd_avx512_omp_parallel.cpp"),
+    "simd_avx2_omp_parallel": os.path.join(SOURCE_DIR, "simd_avx2_omp_parallel.cpp")
 }
 GENERATOR_SCRIPT = os.path.join(UTILITY_DIR, "generator.py")
 REUSE_RATE = 0
@@ -52,6 +56,71 @@ DEBUG = True
 TIMEOUT_LIMIT = 60
 OUTPUT_BASE_DIR = "test_results"
 
+
+def get_cpu_flags():
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.lower().startswith("flags"):
+                    _, value = line.split(":", 1)
+                    return set(value.strip().lower().split())
+    except Exception:
+        pass
+
+    try:
+        proc = subprocess.run(["lscpu"], capture_output=True, text=True, check=True)
+        for line in proc.stdout.splitlines():
+            if line.lower().startswith("flags:"):
+                _, value = line.split(":", 1)
+                return set(value.strip().lower().split())
+    except Exception:
+        pass
+    return set()
+
+
+def get_required_features(name):
+    if "avx512" in name:
+        return ["avx512f", "avx512bw"]
+    if "avx2" in name:
+        return ["avx2"]
+    return []
+
+
+def get_compile_cmd(name, source, binary_name, cpu_flags):
+    base_cmd = ["g++", "-O3", source, "-o", binary_name, "-std=c++17", "-Wno-ignored-attributes", "-fopenmp"]
+    required = get_required_features(name)
+    missing = [feat for feat in required if feat not in cpu_flags]
+    if missing:
+        return None, missing
+
+    for feat in required:
+        base_cmd.append(f"-m{feat}")
+    if DEBUG is False:
+        base_cmd.append("-DNDEBUG")
+    return base_cmd, []
+
+
+def extract_truth_table(stdout_text):
+    # Prefer the last pure bitstring line so checksum/prefix logs do not affect comparison.
+    bit_lines = [line.strip() for line in stdout_text.splitlines() if re.fullmatch(r"[01]+", line.strip())]
+    if bit_lines:
+        return bit_lines[-1]
+    return None
+
+
+def run_one_case(exe, wff, timeout_limit):
+    start_time = time.perf_counter()
+    proc = subprocess.run(
+        [exe],
+        input=wff,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout_limit
+    )
+    end_time = time.perf_counter()
+    return proc, end_time - start_time
+
 def print_status(msg, state):
     # Keep track of longest message so we can overwrite prior content fully
     state["max_width"] = max(state.get("max_width", 0), len(msg))
@@ -75,20 +144,26 @@ def compile_binaries(cpp_files):
     print("\033[1;34m[1/3] Compiling implementations...\033[0m")
     status_state = {"max_width": 0}
     binaries = {}
+    cpu_flags = get_cpu_flags()
+
     for name, source in cpp_files.items():
         if not os.path.exists(source):
             continue
         binary_name = f"./{source.replace('.cpp', '.out')}"
-        compile_cmd = ["g++", "-O3", source, "-o", binary_name, "-std=c++17", "-Wno-ignored-attributes", "-mavx2", "-fopenmp", "-mavx512f", "-mavx512bw"]
-        if DEBUG == False:
-            compile_cmd.append("-DNDEBUG")
+        compile_cmd, missing = get_compile_cmd(name, source, binary_name, cpu_flags)
+
         print_status(f"Compiling {name}...", status_state)
+        if compile_cmd is None:
+            print(f"\nSkipping {name}: missing CPU feature(s): {', '.join(missing)}")
+            continue
         try:
-            subprocess.run(compile_cmd, check=True)
+            subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError:
             print(f"Error compiling {name}")
             continue
         binaries[name] = binary_name
+
+    print()
     return binaries
 
 def save_to_csv(results, output_dir, cpp_names):
@@ -106,7 +181,7 @@ def save_to_csv(results, output_dir, cpp_names):
     except Exception as e:
         print(f"\n\033[1;31mError saving CSV: {e}\033[0m")
 
-def run_benchmark(binaries, test_cases, cpp_names):
+def run_benchmark(binaries, test_cases, cpp_names, check_correctness=False):
     run_id = time.strftime("%Y%m%d_%H%M%S")
     current_run_dir = os.path.join(OUTPUT_BASE_DIR, f"run_{run_id}")
     os.makedirs(current_run_dir, exist_ok=True)
@@ -117,6 +192,11 @@ def run_benchmark(binaries, test_cases, cpp_names):
     total_tests = len(test_cases) * len(cpp_names)
     completed = 0
     status_state = {"max_width": 0}
+
+    reference_exe = binaries.get("legacy") if check_correctness else None
+    if check_correctness and reference_exe is None:
+        print("\033[1;33m[warn] Correctness mode requested, but legacy binary is unavailable.\033[0m")
+        check_correctness = False
     
     for n, length in test_cases:
         case_name = f"n{n}_l{length}"
@@ -136,6 +216,22 @@ def run_benchmark(binaries, test_cases, cpp_names):
         except Exception as e:
             print(f"Error generating formula: {e}")
             continue
+
+        reference_stdout = None
+        reference_bits = None
+        reference_duration = None
+        reference_returncode = None
+        if check_correctness:
+            try:
+                ref_proc, reference_duration = run_one_case(reference_exe, wff, TIMEOUT_LIMIT)
+                reference_stdout = ref_proc.stdout
+                reference_returncode = ref_proc.returncode
+                with open(os.path.join(case_dir, "legacy_reference_output.txt"), "w", encoding="utf-8") as ref_f:
+                    ref_f.write(reference_stdout)
+                reference_bits = extract_truth_table(reference_stdout) if ref_proc.returncode == 0 else None
+            except subprocess.TimeoutExpired:
+                reference_returncode = None
+                reference_bits = None
 
         for name in cpp_names:
             exe = binaries.get(name)
@@ -158,25 +254,39 @@ def run_benchmark(binaries, test_cases, cpp_names):
             output_file = os.path.join(case_dir, f"{name}_output.txt")
             
             try:
-                start_time = time.perf_counter()
-                
-                with open(output_file, "w") as out_f:
-                    proc = subprocess.run(
-                        [exe],
-                        input=wff,
-                        stdout=out_f,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        timeout=TIMEOUT_LIMIT
-                    )
-                
-                end_time = time.perf_counter()
-                duration = end_time - start_time
+                if check_correctness and name == "legacy":
+                    if reference_returncode is None:
+                        results[case_label][name] = "TIMEOUT"
+                        timeout_history[name].append((n, length))
+                        completed += 1
+                        remaining = total_tests - completed
+                        eta_max = remaining * TIMEOUT_LIMIT
+                        print_status(f"[{completed}/{total_tests}] left:{remaining:3d} ETA≤{format_eta(eta_max)}", status_state)
+                        print()
+                        continue
+
+                    proc = subprocess.CompletedProcess([exe], reference_returncode, reference_stdout, "")
+                    duration = reference_duration if reference_duration is not None else 0.0
+                    with open(output_file, "w", encoding="utf-8") as out_f:
+                        out_f.write(reference_stdout)
+                else:
+                    proc, duration = run_one_case(exe, wff, TIMEOUT_LIMIT)
+                    with open(output_file, "w", encoding="utf-8") as out_f:
+                        out_f.write(proc.stdout)
                 
                 if proc.returncode != 0:
                     results[case_label][name] = "RUNTIME_ERR"
                 else:
-                    results[case_label][name] = f"{duration:.6f}s"
+                    if check_correctness and name != "legacy":
+                        candidate_bits = extract_truth_table(proc.stdout)
+                        if reference_bits is None or candidate_bits is None:
+                            results[case_label][name] = "NO_OUTPUT"
+                        elif candidate_bits != reference_bits:
+                            results[case_label][name] = "WRONG_ANS"
+                        else:
+                            results[case_label][name] = f"{duration:.6f}s"
+                    else:
+                        results[case_label][name] = f"{duration:.6f}s"
 
             except subprocess.TimeoutExpired:
                 results[case_label][name] = "TIMEOUT"
@@ -232,6 +342,11 @@ def parse_args():
         default=DEFAULT_SCENARIO_SET,
         help=f"Select which scenario set to run (default: {DEFAULT_SCENARIO_SET}).",
     )
+    parser.add_argument(
+        "--check-correctness",
+        action="store_true",
+        help="Compare each implementation output against legacy output for each case.",
+    )
     return parser.parse_args()
 
 def resolve_cpp_selection(cpp_list_arg):
@@ -256,16 +371,20 @@ if __name__ == "__main__":
         print("\033[1;31mNo implementations selected. Exiting.\033[0m")
         sys.exit(1)
 
+    compile_targets = selected_cpp_files.copy()
+    if args.check_correctness and "legacy" not in compile_targets:
+        compile_targets["legacy"] = CPP_FILES["legacy"]
+
     selected_test_cases = SCENARIO_SETS.get(args.scenario_set, TEST_CASES_QUICK)
 
     bin_paths = {}
     try:
-        bin_paths = compile_binaries(selected_cpp_files)
+        bin_paths = compile_binaries(compile_targets)
         if not bin_paths:
             print("\033[1;31mNo binaries compiled. Exiting.\033[0m")
             sys.exit(1)
 
-        benchmark_data, run_dir = run_benchmark(bin_paths, selected_test_cases, cpp_names)
+        benchmark_data, run_dir = run_benchmark(bin_paths, selected_test_cases, cpp_names, check_correctness=args.check_correctness)
         print_final_report(benchmark_data)
         save_to_csv(benchmark_data, run_dir, cpp_names)
     finally:
