@@ -28,7 +28,8 @@ CPP_FILES = {
     "simd_avx512_omp_parallel": os.path.join(SOURCE_DIR, "simd_avx512_omp_parallel.cpp"),
     "simd_avx2_omp_parallel": os.path.join(SOURCE_DIR, "simd_avx2_omp_parallel.cpp")
 }
-GENERATOR_SCRIPT = os.path.join(UTILITY_DIR, "generator.py")
+GENERATOR_SOURCE = os.path.join(UTILITY_DIR, "generator.cc")
+GENERATOR_BINARY = os.path.join(".", UTILITY_DIR, "generator.out")
 REUSE_RATE = 0
 
 TEST_CASES_FULL = [
@@ -166,6 +167,22 @@ def compile_binaries(cpp_files):
     print()
     return binaries
 
+
+def compile_generator_binary():
+    if not os.path.exists(GENERATOR_SOURCE):
+        print(f"\033[1;31mMissing generator source: {GENERATOR_SOURCE}\033[0m")
+        return False
+
+    compile_cmd = ["g++", "-O3", GENERATOR_SOURCE, "-o", GENERATOR_BINARY, "-std=c++17"]
+    try:
+        subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
+        return True
+    except subprocess.CalledProcessError as exc:
+        print("\033[1;31mError compiling C++ generator\033[0m")
+        if exc.stderr:
+            print(exc.stderr)
+        return False
+
 def save_to_csv(results, output_dir, cpp_names):
     csv_path = os.path.join(output_dir, "benchmark_results.csv")
     headers = ["Scenario"] + cpp_names
@@ -208,7 +225,7 @@ def run_benchmark(binaries, test_cases, cpp_names, check_correctness=False):
         
         try:
             wff = subprocess.check_output(
-                [sys.executable, GENERATOR_SCRIPT, str(length), str(n), str(REUSE_RATE)], 
+                [GENERATOR_BINARY, str(length), str(n), str(REUSE_RATE)], 
                 universal_newlines=True
             ).strip()
             with open(os.path.join(case_dir, "input.txt"), "w") as f:
@@ -320,8 +337,16 @@ def print_final_report(results):
         print(row)
     print("=" * total_width + "\n")
 
-def cleanup_binaries(binaries):
+def cleanup_binaries(binaries, extra_paths=None):
     for path in binaries.values():
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            print(f"Warning: could not remove {path}: {exc}")
+
+    for path in (extra_paths or []):
         try:
             os.remove(path)
         except FileNotFoundError:
@@ -379,6 +404,10 @@ if __name__ == "__main__":
 
     bin_paths = {}
     try:
+        if not compile_generator_binary():
+            print("\033[1;31mGenerator build failed. Exiting.\033[0m")
+            sys.exit(1)
+
         bin_paths = compile_binaries(compile_targets)
         if not bin_paths:
             print("\033[1;31mNo binaries compiled. Exiting.\033[0m")
@@ -388,4 +417,4 @@ if __name__ == "__main__":
         print_final_report(benchmark_data)
         save_to_csv(benchmark_data, run_dir, cpp_names)
     finally:
-        cleanup_binaries(bin_paths)
+        cleanup_binaries(bin_paths, extra_paths=[GENERATOR_BINARY])

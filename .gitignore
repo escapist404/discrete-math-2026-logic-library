@@ -1,5 +1,39 @@
-benchmark/test_results/**/*.txt
-__pycache__
+# Build artifacts
 *.o
 *.d
 *.bin
+*.out
+/build/
+/bin/
+/lib/
+/dist/
+
+# Benchmark results
+benchmark/test_results/**/*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+ENV/
+env/
+.env
+.ipynb_checkpoints/
+
+# IDEs and Editors
+.vscode/
+.idea/
+.vs/
+*.swp
+*.swo
+*~
+.project
+.settings/
+.classpath
+
+# OS specific
+.DS_Store
+Thumbs.db
