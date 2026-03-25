@@ -28,8 +28,8 @@ CPP_FILES = {
     "simd_avx512_omp_parallel": os.path.join(SOURCE_DIR, "simd_avx512_omp_parallel.cpp"),
     "simd_avx2_omp_parallel": os.path.join(SOURCE_DIR, "simd_avx2_omp_parallel.cpp")
 }
-GENERATOR_SOURCE = os.path.join(UTILITY_DIR, "generator.cc")
-GENERATOR_BINARY = os.path.join(".", UTILITY_DIR, "generator.out")
+BUILD_DIR = "build"
+GENERATOR_TARGET = "generator"
 REUSE_RATE = 0
 
 TEST_CASES_FULL = [
@@ -58,47 +58,14 @@ TIMEOUT_LIMIT = 60
 OUTPUT_BASE_DIR = "test_results"
 
 
-def get_cpu_flags():
-    try:
-        with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
-            for line in f:
-                if line.lower().startswith("flags"):
-                    _, value = line.split(":", 1)
-                    return set(value.strip().lower().split())
-    except Exception:
-        pass
-
-    try:
-        proc = subprocess.run(["lscpu"], capture_output=True, text=True, check=True)
-        for line in proc.stdout.splitlines():
-            if line.lower().startswith("flags:"):
-                _, value = line.split(":", 1)
-                return set(value.strip().lower().split())
-    except Exception:
-        pass
-    return set()
+def executable_name(target):
+    if os.name == "nt":
+        return f"{target}.exe"
+    return target
 
 
-def get_required_features(name):
-    if "avx512" in name:
-        return ["avx512f", "avx512bw"]
-    if "avx2" in name:
-        return ["avx2"]
-    return []
-
-
-def get_compile_cmd(name, source, binary_name, cpu_flags):
-    base_cmd = ["g++", "-O3", source, "-o", binary_name, "-std=c++17", "-Wno-ignored-attributes", "-fopenmp"]
-    required = get_required_features(name)
-    missing = [feat for feat in required if feat not in cpu_flags]
-    if missing:
-        return None, missing
-
-    for feat in required:
-        base_cmd.append(f"-m{feat}")
-    if DEBUG is False:
-        base_cmd.append("-DNDEBUG")
-    return base_cmd, []
+def target_binary_path(target):
+    return os.path.join(BUILD_DIR, executable_name(target))
 
 
 def extract_truth_table(stdout_text):
@@ -141,47 +108,42 @@ def should_skip_due_to_prior_timeout(name, n, length, timeout_history):
             return True
     return False
 
-def compile_binaries(cpp_files):
-    print("\033[1;34m[1/3] Compiling implementations...\033[0m")
-    status_state = {"max_width": 0}
-    binaries = {}
-    cpu_flags = get_cpu_flags()
+def configure_and_build_with_cmake():
+    print("\033[1;34m[1/3] Building with CMake...\033[0m")
+    os.makedirs(BUILD_DIR, exist_ok=True)
 
-    for name, source in cpp_files.items():
-        if not os.path.exists(source):
-            continue
-        binary_name = f"./{source.replace('.cpp', '.out')}"
-        compile_cmd, missing = get_compile_cmd(name, source, binary_name, cpu_flags)
-
-        print_status(f"Compiling {name}...", status_state)
-        if compile_cmd is None:
-            print(f"\nSkipping {name}: missing CPU feature(s): {', '.join(missing)}")
-            continue
-        try:
-            subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError:
-            print(f"Error compiling {name}")
-            continue
-        binaries[name] = binary_name
-
-    print()
-    return binaries
-
-
-def compile_generator_binary():
-    if not os.path.exists(GENERATOR_SOURCE):
-        print(f"\033[1;31mMissing generator source: {GENERATOR_SOURCE}\033[0m")
-        return False
-
-    compile_cmd = ["g++", "-O3", GENERATOR_SOURCE, "-o", GENERATOR_BINARY, "-std=c++17"]
+    cmake_config_cmd = [
+        "cmake",
+        "-S", ".",
+        "-B", BUILD_DIR,
+        f"-DBENCHMARK_DEBUG={'ON' if DEBUG else 'OFF'}",
+    ]
     try:
-        subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
-        return True
+        subprocess.run(cmake_config_cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
-        print("\033[1;31mError compiling C++ generator\033[0m")
+        print("\033[1;31mCMake configure failed.\033[0m")
         if exc.stderr:
             print(exc.stderr)
         return False
+
+    cmake_build_cmd = ["cmake", "--build", BUILD_DIR, "-j"]
+    try:
+        subprocess.run(cmake_build_cmd, check=True, capture_output=True, text=True)
+        return True
+    except subprocess.CalledProcessError as exc:
+        print("\033[1;31mCMake build failed.\033[0m")
+        if exc.stderr:
+            print(exc.stderr)
+        return False
+
+
+def resolve_binaries_from_build(target_names):
+    binaries = {}
+    for name in target_names:
+        path = target_binary_path(name)
+        if os.path.exists(path):
+            binaries[name] = path
+    return binaries
 
 def save_to_csv(results, output_dir, cpp_names):
     csv_path = os.path.join(output_dir, "benchmark_results.csv")
@@ -198,7 +160,7 @@ def save_to_csv(results, output_dir, cpp_names):
     except Exception as e:
         print(f"\n\033[1;31mError saving CSV: {e}\033[0m")
 
-def run_benchmark(binaries, test_cases, cpp_names, check_correctness=False):
+def run_benchmark(binaries, test_cases, cpp_names, generator_exe, check_correctness=False):
     run_id = time.strftime("%Y%m%d_%H%M%S")
     current_run_dir = os.path.join(OUTPUT_BASE_DIR, f"run_{run_id}")
     os.makedirs(current_run_dir, exist_ok=True)
@@ -225,7 +187,7 @@ def run_benchmark(binaries, test_cases, cpp_names, check_correctness=False):
         
         try:
             wff = subprocess.check_output(
-                [GENERATOR_BINARY, str(length), str(n), str(REUSE_RATE)], 
+                [generator_exe, str(length), str(n), str(REUSE_RATE)],
                 universal_newlines=True
             ).strip()
             with open(os.path.join(case_dir, "input.txt"), "w") as f:
@@ -337,23 +299,6 @@ def print_final_report(results):
         print(row)
     print("=" * total_width + "\n")
 
-def cleanup_binaries(binaries, extra_paths=None):
-    for path in binaries.values():
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            print(f"Warning: could not remove {path}: {exc}")
-
-    for path in (extra_paths or []):
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            print(f"Warning: could not remove {path}: {exc}")
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark logical formula solvers.")
     parser.add_argument(
@@ -402,19 +347,27 @@ if __name__ == "__main__":
 
     selected_test_cases = SCENARIO_SETS.get(args.scenario_set, TEST_CASES_QUICK)
 
-    bin_paths = {}
-    try:
-        if not compile_generator_binary():
-            print("\033[1;31mGenerator build failed. Exiting.\033[0m")
-            sys.exit(1)
+    if not configure_and_build_with_cmake():
+        print("\033[1;31mBuild step failed. Exiting.\033[0m")
+        sys.exit(1)
 
-        bin_paths = compile_binaries(compile_targets)
-        if not bin_paths:
-            print("\033[1;31mNo binaries compiled. Exiting.\033[0m")
-            sys.exit(1)
+    generator_exe = target_binary_path(GENERATOR_TARGET)
+    if not os.path.exists(generator_exe):
+        print(f"\033[1;31mGenerator binary not found: {generator_exe}\033[0m")
+        sys.exit(1)
 
-        benchmark_data, run_dir = run_benchmark(bin_paths, selected_test_cases, cpp_names, check_correctness=args.check_correctness)
-        print_final_report(benchmark_data)
-        save_to_csv(benchmark_data, run_dir, cpp_names)
-    finally:
-        cleanup_binaries(bin_paths, extra_paths=[GENERATOR_BINARY])
+    resolved_targets = list(compile_targets.keys())
+    bin_paths = resolve_binaries_from_build(resolved_targets)
+    if not bin_paths:
+        print("\033[1;31mNo target binaries found in build directory. Exiting.\033[0m")
+        sys.exit(1)
+
+    benchmark_data, run_dir = run_benchmark(
+        bin_paths,
+        selected_test_cases,
+        cpp_names,
+        generator_exe,
+        check_correctness=args.check_correctness,
+    )
+    print_final_report(benchmark_data)
+    save_to_csv(benchmark_data, run_dir, cpp_names)
